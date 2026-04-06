@@ -1,0 +1,9 @@
+wa-engine/node_modules/
+wa-engine/.wwebjs_auth/
+wa-engine/.env
+wa-dashboard/node_modules/
+wa-dashboard/vendor/
+wa-dashboard/.env
+wa-dashboard/storage/*.key
+wa-dashboard/public/storage
+.wwebjs_auth/
