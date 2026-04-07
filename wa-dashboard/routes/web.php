@@ -1,15 +1,29 @@
 <?php
 
-use App\Http\Controllers\MessageController;
+use App\Http\Controllers\ProfileController;
 use Illuminate\Support\Facades\Route;
 
 Route::get('/', function () {
     return view('welcome');
+})->middleware('auth')->name('home');
+
+Route::get('/dashboard', function () {
+    return view('dashboard');
+})->middleware(['auth', 'verified'])->name('dashboard');
+
+Route::middleware('auth')->group(function () {
+    Route::get('/profile', [ProfileController::class, 'edit'])->name('profile.edit');
+    Route::patch('/profile', [ProfileController::class, 'update'])->name('profile.update');
+    Route::delete('/profile', [ProfileController::class, 'destroy'])->name('profile.destroy');
 });
 
-// API untuk simpan pesan ke antrean
-Route::post('/send-message', [MessageController::class, 'store']);
+use App\Http\Controllers\DeviceController;
 
-// API untuk ambil log pesan terbaru (untuk update tabel otomatis)
-Route::get('/get-messages', [MessageController::class, 'getMessages']);
-Route::post('/send-bulk', [MessageController::class, 'bulkStore']);
+// routes/web.php
+
+
+Route::middleware('auth')->group(function () {
+    Route::resource('devices', DeviceController::class);
+    Route::post('/devices/{device}/logout', [DeviceController::class, 'logout'])->name('devices.logout');
+});
+require __DIR__ . '/auth.php';

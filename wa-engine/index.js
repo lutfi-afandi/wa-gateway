@@ -1,5 +1,5 @@
 const { Client, LocalAuth } = require("whatsapp-web.js");
-const QRCode = require("qrcode"); // GUNAKAN INI, bukan qrcode-terminal
+const QRCode = require("qrcode");
 const mysql = require("mysql");
 const express = require("express");
 const http = require("http");
@@ -7,128 +7,176 @@ const { Server } = require("socket.io");
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: "*" },
-});
+const io = new Server(server, { cors: { origin: "*" } });
 
+// 1. RAK KUNCI (Session Storage)
+// Kita simpan semua instance client WA di sini agar tidak hilang
+const sessions = new Map();
+
+// 2. KONEKSI DATABASE
 const db = mysql.createConnection({
   host: "localhost",
   user: "root",
   password: "",
-  database: "wa_gateway", // Pastikan nama database sudah benar
+  database: "wa_gateway",
 });
 
 db.connect((err) => {
-  if (err) {
-    console.error("Gagal koneksi ke MySQL:", err);
-    return;
-  }
-  console.log("MySQL Terhubung!");
+  if (err) throw err;
+  console.log("Database Connected!");
+  // Saat server Node.js nyala, otomatis hidupkan semua WA yang statusnya 'connected'
+  initAllDevices();
 });
 
-// Inisiasi WhatsApp Client
-const client = new Client({
-  authStrategy: new LocalAuth(),
-  puppeteer: {
-    headless: true, // Set true agar berjalan di background
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
-  },
-});
+/**
+ * FUNGSI: Menjalankan robot WA berdasarkan Device ID
+ * @param {string} deviceId - ID dari tabel devices
+ */
+const initDevice = (deviceId) => {
+  console.log(`Memulai inisialisasi Device ID: ${deviceId}`);
 
-// VARIABEL PENYIMPAN QR TERAKHIR
-let lastQR = "";
-
-// PINDAHKAN EVENT LISTENER KE LUAR io.on
-client.on("qr", (qr) => {
-  console.log("QR Diterima, mengonversi ke Base64...");
-  QRCode.toDataURL(qr, (err, url) => {
-    lastQR = url; // Simpan QR terakhir
-    io.emit("qr_code", url);
-    io.emit("message", "QR Code diterima, silakan scan!");
+  // Kita buat instance baru khusus untuk device ini
+  const client = new Client({
+    // Folder auth dibedakan per device: .wwebjs_auth/session-device_1
+    authStrategy: new LocalAuth({ clientId: `device_${deviceId}` }),
+    puppeteer: {
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    },
   });
-});
 
-let isReady = false; // Variabel penanda
-client.on("ready", () => {
-  console.log("WhatsApp is Ready!");
-  isReady = true;
-  lastQR = ""; // Hapus cache QR karena sudah login
-  io.emit("message", "WhatsApp sudah terhubung!");
-  io.emit("status", "connected");
-});
+  // Simpan ke rak kunci
+  sessions.set(deviceId, { client: client, ready: false });
 
-client.on("authenticated", () => {
-  console.log("Authenticated!");
-});
+  client.on("qr", (qr) => {
+    QRCode.toDataURL(qr, (err, url) => {
+      // Kirim QR hanya ke 'Room' milik device ini agar tidak tertukar
+      io.to(`device_${deviceId}`).emit("qr_code", url);
+    });
+  });
 
-client.on("disconnected", () => {
-  isReady = false; // Reset status
-  io.emit("message", "WhatsApp terputus, silakan scan ulang!");
-  io.emit("status", "disconnected");
-});
+  client.on("ready", () => {
+    console.log(`Device ${deviceId} is Ready!`);
+    // Update status di Map
+    const session = sessions.get(deviceId);
+    if (session) session.ready = true;
 
-// SOCKET IO CONNECTION
-io.on("connection", (socket) => {
-  console.log("Dashboard terhubung ke socket");
+    const info = client.info;
+    const connectedNumber = info.wid.user; // Ambil nomor WA-nya
 
-  // JIKA SUDAH ADA QR, LANGSUNG KIRIM KE USER YANG BARU CONNECT
-  if (lastQR) {
-    socket.emit("qr_code", lastQR);
-    socket.emit("message", "Silakan scan QR Code yang tersedia");
-  }
-});
+    // Update status di Database
+    db.query(
+      "UPDATE devices SET status = 'connected', number = ? WHERE id = ?",
+      [connectedNumber, deviceId],
+    );
 
-// Jalankan client & server
-client.initialize();
-server.listen(3000, () => {
-  console.log("Server berjalan di http://localhost:3000");
-});
+    io.to(`device_${deviceId}`).emit("status", "connected");
+  });
 
-// Fungsi untuk mengecek antrean di database
-const checkAndSend = () => {
-  // CEK DISINI: Jika belum ready, jangan lakukan apa-apa
-  if (!isReady) {
-    console.log("Menunggu WhatsApp Ready sebelum cek antrean...");
-    return;
-  }
+  client.on("disconnected", () => {
+    console.log(`Device ${deviceId} Disconnected!`);
+    sessions.delete(deviceId);
+    db.query("UPDATE devices SET status = 'disconnected' WHERE id = ?", [
+      deviceId,
+    ]);
+    io.to(`device_${deviceId}`).emit("status", "disconnected");
+  });
 
-  // Cari pesan yang statusnya 'pending'
+  client.initialize();
+};
+
+/**
+ * FUNGSI: Menghidupkan ulang semua session yang aktif di DB
+ */
+const initAllDevices = () => {
   db.query(
-    "SELECT * FROM messages WHERE status = 'pending' LIMIT 5",
+    "SELECT id FROM devices WHERE status = 'connected'",
     (err, results) => {
-      if (err) throw err;
+      if (err) return;
+      results.forEach((row) => initDevice(row.id.toString()));
+    },
+  );
+};
 
-      results.forEach((data) => {
-        const number = data.receiver + "@c.us"; // Format WhatsApp
-        const message = data.message;
+// 3. SOCKET LOGIC: Pemisahan Kamar (Rooms)
+io.on("connection", (socket) => {
+  const deviceId = socket.handshake.query.deviceId;
 
-        console.log(`Mengirim pesan ke ${data.receiver}...`);
+  if (deviceId) {
+    // User masuk ke kamar khusus device miliknya
+    socket.join(`device_${deviceId}`);
+    console.log(`User memantau Device: ${deviceId}`);
 
-        // Ubah status jadi 'sending' agar tidak terkirim ganda
-        db.query("UPDATE messages SET status = 'sending' WHERE id = ?", [
-          data.id,
-        ]);
+    // Jika device belum ada di memori, kita buatkan instance-nya
+    if (!sessions.has(deviceId)) {
+      initDevice(deviceId);
+    }
+  }
+});
 
-        client
-          .sendMessage(number, message)
-          .then((response) => {
-            // Jika berhasil terkirim
-            db.query("UPDATE messages SET status = 'sent' WHERE id = ?", [
-              data.id,
-            ]);
-            console.log(`Pesan ke ${data.receiver} BERHASIL.`);
-          })
-          .catch((err) => {
-            // Jika gagal
-            db.query("UPDATE messages SET status = 'failed' WHERE id = ?", [
-              data.id,
-            ]);
-            console.log(`Pesan ke ${data.receiver} GAGAL:`, err);
-          });
+/**
+ * FUNGSI: Patroli Pesan (The Queue Consumer)
+ */
+const checkAndSend = () => {
+  // Kita ambil pesan yang pending
+  db.query(
+    "SELECT * FROM messages WHERE status = 'pending' LIMIT 10",
+    (err, results) => {
+      if (err) return;
+
+      results.forEach((msg) => {
+        const session = sessions.get(msg.device_id.toString());
+
+        // Validasi: Apakah robot pengirimnya sudah Ready?
+        if (session && session.ready) {
+          // Update ke processing agar tidak diambil robot lain
+          db.query("UPDATE messages SET status = 'processing' WHERE id = ?", [
+            msg.id,
+          ]);
+
+          session.client
+            .sendMessage(`${msg.receiver}@c.us`, msg.message)
+            .then(() => {
+              db.query("UPDATE messages SET status = 'sent' WHERE id = ?", [
+                msg.id,
+              ]);
+            })
+            .catch((err) => {
+              db.query(
+                "UPDATE messages SET status = 'failed', error_log = ? WHERE id = ?",
+                [err.message, msg.id],
+              );
+            });
+        }
       });
     },
   );
 };
 
-// Jalankan pengecekan setiap 5 detik
 setInterval(checkAndSend, 5000);
+
+const checkLogoutCommand = () => {
+  // Cari device yang di memori (Map) berstatus aktif, tapi di DB diminta 'disconnected'
+  db.query(
+    "SELECT id FROM devices WHERE status = 'disconnected'",
+    (err, results) => {
+      if (err) return;
+
+      results.forEach((row) => {
+        const session = sessions.get(row.id.toString());
+        if (session) {
+          console.log(
+            `Mematikan Engine Device ${row.id} karena permintaan Logout...`,
+          );
+          session.client.destroy(); // Matikan Puppeteer
+          sessions.delete(row.id.toString()); // Hapus dari Map RAM
+        }
+      });
+    },
+  );
+};
+
+// Jalankan patroli logout setiap 5 detik
+setInterval(checkLogoutCommand, 5000);
+
+server.listen(3000, () => console.log("Engine running on port 3000"));
