@@ -46,6 +46,17 @@
 <body>
     <div class="container py-5">
         <h2 class="mb-4 text-center">📱 WA Gateway Dashboard</h2>
+        <div class="row">
+            <div class="col-md-6">
+                <div class="card p-4 mb-4 text-center">
+                    <h5>Scan WhatsApp</h5>
+                    <div id="qrcode-container" class="my-3">
+                        <p id="status-text" class="text-muted">Menunggu koneksi...</p>
+                        <img id="qrcode-img" src="" style="display:none; width: 200px; margin: 0 auto;">
+                    </div>
+                </div>
+            </div>
+        </div>
 
         <div class="row">
             <div class="col-md-4">
@@ -116,6 +127,7 @@
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
     <script>
         // Logika AJAX akan kita tulis di sini pada tahap selanjutnya
         $(document).ready(function() {
@@ -179,6 +191,34 @@
                     loadMessages();
                 });
             });
+
+            // hubungkan ke nodejs socket server untuk update QR code
+            const socket = io('http://localhost:3000');
+
+            // tangkap event QR code dari server
+            socket.on('qr_code', function(url) {
+                $('#qrcode-img').attr('src', url).show();
+                $('#status-text').text('Scan QR Code dengan WhatsApp Anda');
+            })
+
+            // tangkap status pesan dari server
+            socket.on('message', function(msg) {
+                $('#status-text').text(msg); // refresh tabel saat ada update status
+            });
+
+            // tangkap status koneksi dari server
+            // 3. Tangkap status koneksi (Sesuaikan nama event 'status')
+            socket.on('status', function(status) {
+                console.log("Status Koneksi:", status);
+                if (status == 'connected') {
+                    $('#status-text').html('<span class="text-success">✔ WhatsApp terhubung!</span>');
+                    $('#qrcode-img').hide();
+                } else if (status == 'disconnected') {
+                    $('#status-text').text('Koneksi terputus. Silakan scan ulang.');
+                    $('#qrcode-img').hide();
+                }
+            });
+
         });
     </script>
 
